@@ -1,0 +1,318 @@
+---
+title: "Spotify CS Forecast Exercise"
+author: "Carlos Amiel"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    code_folding: hide
+    toc_depth: 3
+    toc_float:
+      collapsed: yes
+      smooth_scroll: no
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+## The Analysis
+
+Using the data set provided and outlined below, we’d like you to build a forecast for customer service email volume at the daily level until December 31, 2021. The purpose of the forecast will be used to determine our daily customer service staffing needs based on the email volume of the day. 
+
+## Load Libraries
+
+```{r}
+library(xgboost)
+library(tidymodels)
+library(modeltime)
+library(tidyverse)
+library(lubridate)
+library(timetk)
+library(skimr) 
+library(readxl)
+library(scales)
+
+```
+
+## The Data
+
+### Data Overview
+
+Based on information, here is what we know about our data: *The data set contains simulated data for Spotify customer service email volume, subscriptions, and MAUs, but the patterns within are similar to real data. Email, subs, and MAU data are available from January 1, 2019 to May 31, 2021. Forecast subs and MAU were estimated in March 2021. You do not have to use every variable listed for your final model.*
+
+### Data Import
+
+First we'll import the data as an excel file
+
+```{r}
+CS_Forecast_Exercise_Data <- read_excel("data/CS Forecast Exercise Data.xlsx", 
+    col_types = c("date", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "numeric", "numeric"))
+```
+
+We'll double check our date formats and change as needed. 
+
+```{r}
+# check date format
+# str(CS_Forecast_Exercise_Data)
+
+# change to Date
+CS_Forecast_Exercise_Data <- CS_Forecast_Exercise_Data %>% mutate(date = as.Date(date))
+```
+
+
+Next we'll briefly summarize our data below. We can see that we have 1,096 total records with 12 variables; one date variable and the rest numeric. 
+
+```{r}
+skim(CS_Forecast_Exercise_Data)
+```
+
+### Time Series Visuals
+
+We'll use this information to visually inspect *date, email, subs, subs_standard, subs_student, subs_family* as a collection of time series. What we can see immediately is that *subs* and *sub_family* are both fairly linear trends without visually strong seasonal patterns. On the other hand *subs_standard* exhibits both a linear trend and what looks like monthly seasonality. Meanwhile *subs_student* shows a steadily increasing volume peaking in early 2020 and steadily declining thereafter. 
+
+```{r fig.width=10}
+CS_Forecast_Exercise_Data %>%
+  select(date, email, subs, subs_standard, subs_student, subs_family) %>% 
+  filter(date <= '2021-05-31') %>% 
+  pivot_longer(!date, names_to="type", values_to="count") %>% 
+  ggplot(aes(x = date, y = count)) +
+  geom_line() + 
+  facet_wrap(~ type, scales = "free_y") +
+  scale_y_continuous(label=comma) +
+  theme_minimal()
+```
+
+Next we we'll want to focus on our outcome variable *email* to more closely inspect the time series for visual cues that may be helpful in forecasting such as seasonality. 
+
+We can see from the initial plot there are various spikes in volume that are over about 20k. Inspecting the dates there doesn't seem to be a common date occurrence for these spikes. There doesn't seem to be a strong overall trend either. 
+
+```{r}
+CS_Forecast_Exercise_Data %>% 
+  select(date, email) %>% 
+  filter(date <= '2021-05-31') %>% 
+  plot_time_series(date, email)
+```
+
+Lets plot out our time series but this time annotate apparent anomalies. Inspecting the dates of apparent anomalies, we can confirm no recurring date pattern, letting us know we may benefit from cleaning up these anomalies.
+
+```{r}
+CS_Forecast_Exercise_Data %>% 
+  select(date, email) %>% 
+  filter(date <= '2021-05-31') %>% 
+  plot_anomaly_diagnostics(date, email)
+```
+
+If we now clean up our *email* time series we can re-inspect the new data visually. We can still confirm a lack of strong trend, but in order to explore seasonality, we'll need to plot our data in a different manner. 
+
+```{r}
+CS_Forecast_Exercise_Data %>% 
+  select(date, email) %>% 
+  filter(date <= '2021-05-31') %>% 
+  mutate(email = ts_clean_vec(email)) %>% 
+  plot_time_series(date, email)
+```
+
+In our next plot we'll explore seasonal diagnostics more closely. Weekly seasonality does seem apparent with Saturday and Sunday representing down days, and the work week a relatively steady plateau of volume. 
+
+```{r fig.width=10, fig.height=10}
+CS_Forecast_Exercise_Data %>% 
+  select(date, email) %>% 
+  filter(date <= '2021-05-31') %>% 
+  mutate(email = ts_clean_vec(email)) %>% 
+  plot_seasonal_diagnostics(date, email, .interactive = FALSE) +
+  theme_minimal()
+```
+
+## Forecast
+
+Next we'll set up a forecast framework where various models will be trained and evaluated.
+
+First well split our data into training and testing portions. This will allow us to evaluate our models.
+
+```{r}
+# create forecast series
+cs_ts <- CS_Forecast_Exercise_Data %>% 
+  select(date, email) %>% 
+  filter(date <= '2021-05-31') %>% 
+  mutate(email = ts_clean_vec(email))
+
+# Split Data 80/20
+splits <- initial_time_split(cs_ts, prop = 0.8)
+```
+
+Next we'll create multiple models to evaluate
+
+```{r}
+# Model 1: auto_arima ----
+model_fit_arima_no_boost <- arima_reg() %>%
+    set_engine(engine = "auto_arima") %>%
+    fit(email ~ date, data = training(splits))
+
+# Model 2: arima_boost ----
+model_fit_arima_boosted <- arima_boost(
+    min_n = 2,
+    learn_rate = 0.015
+) %>%
+    set_engine(engine = "auto_arima_xgboost") %>%
+    fit(email ~ date + as.numeric(date) + day(date),
+        data = training(splits))
+
+# Model 3: ets ----
+model_fit_ets <- exp_smoothing() %>%
+    set_engine(engine = "ets") %>%
+    fit(email ~ date, data = training(splits))
+
+# Model 4: prophet ----
+model_fit_prophet <- prophet_reg() %>%
+    set_engine(engine = "prophet", weekly.seasonality=TRUE) %>%
+    fit(email ~ date, data = training(splits))
+
+# Model 5: lm ----
+model_fit_lm <- linear_reg() %>%
+    set_engine("lm") %>%
+    fit(email ~ as.numeric(date) + wday(date),
+        data = training(splits))
+
+
+```
+
+Now we'll add these to a model structure that allows us to more easily handle model evaluation
+
+```{r}
+models_tbl <- modeltime_table(
+    model_fit_arima_no_boost,
+    model_fit_arima_boosted,
+    model_fit_ets,
+    model_fit_prophet,
+    model_fit_lm
+)
+
+models_tbl
+```
+
+Now we'll evaluate the models on test data and add this data to our model table structure.
+
+```{r}
+calibration_tbl <- models_tbl %>%
+    modeltime_calibrate(new_data = testing(splits))
+
+calibration_tbl
+```
+
+Now we can use this framework to visually inspect our models. 
+
+```{r}
+calibration_tbl %>%
+    modeltime_forecast(
+        new_data    = testing(splits),
+        actual_data = cs_ts
+    ) %>%
+    plot_modeltime_forecast(
+      .legend_max_width = 25, # For mobile screens
+      .interactive      = TRUE
+    )
+```
+
+All models have wide confidence intervals and don't seem to capture the decreasing trend beginning approximately April 2021. Both ARIMA models capture the weekly patterns well and deviate the least in the period after April 2021.
+
+Now we should also take a look at our error metrics in tabular form. The boosted ARIMA model has the lowest mean absolute error and highest r squared.
+
+```{r}
+calibration_tbl %>%
+    modeltime_accuracy() %>%
+    table_modeltime_accuracy(
+        .interactive = FALSE
+    )
+```
+
+
+Now we'll refit these models to the entire data set and forecast forward 7 months to the end of 2021. All models except for our linear model provide reasonable step ahead forecasts for daily email volume to the end of 2021.  
+
+```{r}
+refit_tbl <- calibration_tbl %>%
+    modeltime_refit(data = cs_ts)
+
+refit_tbl %>%
+    modeltime_forecast(h = "7 months", actual_data = cs_ts) %>%
+    plot_modeltime_forecast(
+      .legend_max_width = 25, # For mobile screens
+      .interactive      = TRUE
+    )
+```
+
+## Conclusion / Next Steps
+
+ - All models except for our linear models capture the weekly pattern of email volume well and provide reasonable forecasts
+ - In testing each model the ARIMA & ARIMA Boost models performed the best
+ - Choose a model considering both accuracy, interpret-ability, and computational cost
+ - Develop further studies(s) based on model(s) chosen
+ - Develop computational workflow based on model(s) chosen
+
+## Epilogue
+
+As an example, we'll assume that a consensus has been made to explore the regression model further. To do this the model is isolated and further developed by adding features such as nominal day of week and holiday. From this we can view our model coefficients for a preliminary confirmation of seasonal effects, as well as those of holidays. 
+
+```{r fig.height=8, fig.width=8}
+# recipe
+lm_rec <- 
+  recipe(email ~ ., data = training(splits)) %>% 
+  step_date(date, features = c("dow", "month")) %>%               
+  step_holiday(date, holidays = timeDate::listHolidays("US")) %>% 
+  step_rm(date) %>% 
+  step_dummy(all_nominal(), -all_outcomes())
+
+# model specs
+lm_spec <- linear_reg() %>%
+  set_engine(engine = "lm")
+
+# lm wflow
+lm_wflow <- 
+  workflow() %>% 
+  add_model(lm_spec) %>% 
+  add_recipe(lm_rec)
+
+# lm fit
+lm_fit <- 
+  lm_wflow %>% 
+  fit(data = training(splits))
+
+# view fit coefs
+lm_fit %>% 
+  pull_workflow_fit() %>% 
+  tidy(conf.int = TRUE) %>% 
+  ggplot(aes(term, estimate)) +
+  geom_point() +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high)) +
+  coord_flip() +
+  labs(title = "Coefficients of a linear regression model")
+```
+
+We can also check to see if the model has improved with the added features. Using our previous model as comparison we can see that our *rmse* has improved from a previous value of approximately 2130 down to about 1750. This improvement is along the lines of the best time series model in terms of *rmse* and *r2* measures. We now have two viable choices for forecasting, an ARIMA variant as well as a more parsimonious linear model.
+
+```{r}
+# refit on all
+last_lm <- 
+  lm_wflow %>% 
+  last_fit(splits)
+
+# view metrics
+last_lm %>% 
+  collect_metrics() %>% 
+  select(-.config, -.estimator) %>% knitr::kable()
+```
